@@ -147,8 +147,56 @@ def check_flash_crash_signal(df):
     
     return is_crash and is_green and is_volume_spike
 
+# ==========================================
+# 5. ESECUZIONE ORDINI (BATCH ORDER PLACEMENT)
+# ==========================================
 def place_dca_grid(current_price):
     print(f"\n{C_GREEN}=============================================================={C_RESET}")
+    print(f"{C_GREEN}🚀 FLASH CRASH RILEVATO! LANCIO LA RETE IN BATCH! 🚀{C_RESET}")
+    print(f"{C_GREEN}=============================================================={C_RESET}")
+    print(f"Prezzo di innesco: {current_price} USDT\n")
+    
+    # 1. Prepariamo la scatola vuota che conterrà tutti gli ordini
+    batch_order_list = []
+    
+    # 2. Riempiamo la scatola
+    for i in range(len(GRID_DROPS)):
+        order_price = current_price * (1 - GRID_DROPS[i])
+        usd_amount = CAPITAL_TO_USE * GRID_ALLOCATIONS[i]
+        
+        sol_size = round_step(usd_amount / order_price, SIZE_DECIMALS)
+        price_str = round_step(order_price, PRICE_DECIMALS)
+        tp_str = round_step(order_price * (1 + TAKE_PROFIT_PCT), PRICE_DECIMALS)
+        sl_str = round_step(order_price * (1 - STOP_LOSS_PCT), PRICE_DECIMALS)
+        
+        # Creiamo il singolo ordine e lo aggiungiamo alla lista
+        single_order = {
+            "symbol": SYMBOL,
+            "productType": PRODUCT_TYPE,
+            "marginMode": "crossed", 
+            "marginCoin": "USDT",
+            "size": sol_size,
+            "price": price_str,
+            "side": "buy",
+            "tradeSide": "open",
+            "orderType": "limit",
+            "force": "gtc",
+            "presetTakeProfitPrice": tp_str,
+            "presetStopLossPrice": sl_str,
+            "clientOid": f"FC_{int(time.time()*1000)}_{i}"
+        }
+        batch_order_list.append(single_order)
+        print(f"{C_CYAN}[*] Preparato Ordine {i+1}:{C_RESET} {sol_size} SOL a {price_str}$")
+        
+    # 3. Spariamo tutta la scatola a Bitget in un millisecondo
+    print(f"📡 Invio pacchetto Batch a Bitget...")
+    res = bitget_request('POST', '/api/v2/mix/order/batch-orders', body=batch_order_list)
+    
+    if res and res.get('code') == '00000':
+        print(f"{C_GREEN}[+] Rete DCA piazzata simultaneamente con successo!{C_RESET}")
+    else:
+        print(f"{C_RED}[-] Errore nell'invio del Batch Order.{C_RESET}")    
+        print(f"\n{C_GREEN}=============================================================={C_RESET}")
     print(f"{C_GREEN}🚀 FLASH CRASH RILEVATO! LANCIO LA RETE DCA! 🚀{C_RESET}")
     print(f"{C_GREEN}=============================================================={C_RESET}")
     print(f"Prezzo di innesco: {current_price} USDT\n")
@@ -199,7 +247,7 @@ def update_dashboard(current_price, recent_high, current_drop_pct):
             if isinstance(data_list, list):
                 for coin in data_list:
                     if coin.get('marginCoin') == 'USDT':
-                        usdt_balance = float(coin.get('equity', 0))
+                        usdt_balance = float(coin.get('accountEquity', 0))
                         break
                     
         if INITIAL_BALANCE == 0.0 and usdt_balance > 0:
