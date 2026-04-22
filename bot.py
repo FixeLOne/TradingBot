@@ -1,14 +1,22 @@
-import ccxt
 import pandas as pd
 import time
+import os
 from datetime import datetime
+import hmac
+import hashlib
+import base64
+import requests
+import json
+from dotenv import load_dotenv 
+
+load_dotenv()
 
 # ==========================================
 # 1. CONFIGURAZIONE CHIAVI API BITGET
 # ==========================================
-API_KEY = 'LA_TUA_API_KEY'
-SECRET_KEY = 'IL_TUO_SECRET_KEY'
-PASSPHRASE = 'LA_TUA_PASSPHRASE'
+API_KEY = os.getenv('API_KEY') or 'LA_TUA_API_KEY'
+SECRET_KEY = os.getenv('SECRET_KEY') or 'IL_TUO_SECRET_KEY'
+PASSPHRASE = os.getenv('PASSPHRASE') or 'LA_TUA_PASSPHRASE'
 
 # Colori per la console
 C_GREEN = '\033[92m'
@@ -17,40 +25,31 @@ C_CYAN = '\033[96m'
 C_YELLOW = '\033[93m'
 C_RESET = '\033[0m'
 
-exchange = ccxt.bitget({
-    'apiKey': API_KEY,
-    'secret': SECRET_KEY,
-    'password': PASSPHRASE,
-    'enableRateLimit': True,
-    'options': {
-        'defaultType': 'swap', # Usa i Futures Perpetui (UTA)
-    }
-})
-
 # ==========================================
-# 2. PARAMETRI DI BASE DEL BOT
+# 2. PARAMETRI DI BASE DEL BOT E PRECISIONE
 # ==========================================
-SYMBOL = 'SOL/USDT:USDT'
+SYMBOL = 'SOLUSDT'           
+PRODUCT_TYPE = 'USDT-FUTURES'
 TIMEFRAME = '5m'
-CAPITAL_TO_USE = 100.0  # USDT totali da destinare a questa operazione
-INITIAL_BALANCE = 0.0   # Non toccare, valorizzato in automatico
+CAPITAL_TO_USE = 100.0       
+
+PRICE_DECIMALS = 4           
+SIZE_DECIMALS = 1            
+
+INITIAL_BALANCE = 0.0        
 
 # ==========================================
-# 3. PARAMETRI DI STRATEGIA (TOTALMENTE MODIFICABILI)
+# 3. PARAMETRI DI STRATEGIA
 # ==========================================
+CRASH_DROP_PCT = 0.03       
+VOL_SPIKE_MULT = 1.5        
 
-# -- Condizioni per scovare il Flash Crash --
-CRASH_DROP_PCT = 0.03       # Crollo del 3% dal massimo recente
-VOL_SPIKE_MULT = 1.5        # Volume superiore del 50% rispetto alla media a 50 periodi
+TAKE_PROFIT_PCT = 0.025     
+STOP_LOSS_PCT = 0.050       
+MAX_HOLD_CANDLES = 12       
 
-# -- Gestione Rischio e Uscita --
-TAKE_PROFIT_PCT = 0.025     # +2.5% di profitto per singolo ordine limite
-STOP_LOSS_PCT = 0.050       # -5.0% di stop loss rigido per singolo ordine
-MAX_HOLD_CANDLES = 12       # 12 candele da 5m = 1 Ora esatta prima di uscire
-
-# -- Impostazioni Griglia DCA --
-GRID_DROPS = [0.005, 0.015, 0.025]        # Distanza ordini limite: -0.5%, -1.5%, -2.5% dal prezzo attuale
-GRID_ALLOCATIONS = [0.30, 0.30, 0.40]     # Divisione capitale: 30%, 30%, 40%
+GRID_DROPS = [0.005, 0.015, 0.025]        
+GRID_ALLOCATIONS = [0.30, 0.30, 0.40]     
 
 # Variabili di Stato Globali
 in_position = False
@@ -59,14 +58,79 @@ candles_waited = 0
 last_closed_candle_time = None
 
 # ==========================================
-# 4. LOGICA DI ESTRAZIONE DATI E SEGNALI
+# 4. MOTORE API BITGET (BARE-METAL)
+# ==========================================
+def sign(message, secret_key):
+    mac = hmac.new(
+        bytes(secret_key, encoding='utf-8'),
+        bytes(message, encoding='utf-8'),
+        digestmod=hashlib.sha256
+    )
+    return base64.b64encode(mac.digest()).decode()
+
+def bitget_request(method, endpoint, params=None, body=None):
+    base_url = "https://api.bitget.com"
+    timestamp = str(int(time.time() * 1000))
+    
+    query_str = ""
+    if params and method.upper() == 'GET':
+        sorted_params = []
+        for k in sorted(params.keys()):
+            sorted_params.append(f"{k}={params[k]}")
+        query_str = "?" + "&".join(sorted_params)
+        
+    body_str = json.dumps(body) if body else ""
+    
+    prehash = timestamp + method.upper() + endpoint + query_str + body_str
+    signature = sign(prehash, SECRET_KEY)
+    
+    headers = {
+        "ACCESS-KEY": API_KEY,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": PASSPHRASE,
+        "Content-Type": "application/json",
+        "locale": "en-US"
+    }
+    
+    url = base_url + endpoint + query_str
+    
+    try:
+        if method.upper() == 'GET':
+            response = requests.get(url, headers=headers)
+        else:
+            response = requests.post(url, headers=headers, data=body_str)
+            
+        data = response.json()
+        if data.get('code') != '00000':
+            # Ignoriamo i warning silenziosi su ordini vuoti, stampiamo solo errori seri
+            if "Order not exist" not in str(data.get('msg')):
+                print(f"{C_RED}[API ERROR {endpoint}] {data.get('msg')}{C_RESET}")
+        return data
+    except Exception as e:
+        print(f"{C_RED}[NETWORK ERROR] Impossibile contattare Bitget: {e}{C_RESET}")
+        return None
+
+def round_step(value, decimals):
+    return f"{float(value):.{decimals}f}"
+
+# ==========================================
+# 5. LOGICA STRATEGICA
 # ==========================================
 def get_market_data():
     try:
-        bars = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=60)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
+        url = f"https://api.bitget.com/api/v2/mix/market/candles?symbol={SYMBOL}&productType={PRODUCT_TYPE}&granularity={TIMEFRAME}&limit=60"
+        response = requests.get(url).json()
+        
+        if response.get('code') == '00000':
+            bars = response['data']
+            df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'base_vol', 'quote_vol'])
+            for col in ['open', 'high', 'low', 'close', 'base_vol']:
+                df[col] = df[col].astype(float)
+            df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
+            df.rename(columns={'base_vol': 'volume'}, inplace=True)
+            return df
+        return None
     except Exception as e:
         print(f"{C_RED}[!] Errore download dati candele: {e}{C_RESET}")
         return None
@@ -83,110 +147,144 @@ def check_flash_crash_signal(df):
     
     return is_crash and is_green and is_volume_spike
 
-# ==========================================
-# 5. ESECUZIONE ORDINI (ORDER PLACEMENT)
-# ==========================================
 def place_dca_grid(current_price):
-    print(f"\n{C_GREEN}=========================================={C_RESET}")
-    print(f"{C_GREEN}🚀 FLASH CRASH RILEVATO! LANCIO LA RETE! 🚀{C_RESET}")
-    print(f"{C_GREEN}=========================================={C_RESET}")
+    print(f"\n{C_GREEN}=============================================================={C_RESET}")
+    print(f"{C_GREEN}🚀 FLASH CRASH RILEVATO! LANCIO LA RETE DCA! 🚀{C_RESET}")
+    print(f"{C_GREEN}=============================================================={C_RESET}")
     print(f"Prezzo di innesco: {current_price} USDT\n")
     
     for i in range(len(GRID_DROPS)):
         order_price = current_price * (1 - GRID_DROPS[i])
         usd_amount = CAPITAL_TO_USE * GRID_ALLOCATIONS[i]
         
-        # Manteniamo le stringhe per rispettare al 100% la precisione richiesta da Bitget
-        sol_amount_str = exchange.amount_to_precision(SYMBOL, usd_amount / order_price)
-        price_str = exchange.price_to_precision(SYMBOL, order_price)
+        sol_size = round_step(usd_amount / order_price, SIZE_DECIMALS)
+        price_str = round_step(order_price, PRICE_DECIMALS)
+        tp_str = round_step(order_price * (1 + TAKE_PROFIT_PCT), PRICE_DECIMALS)
+        sl_str = round_step(order_price * (1 - STOP_LOSS_PCT), PRICE_DECIMALS)
         
-        tp_price_str = exchange.price_to_precision(SYMBOL, order_price * (1 + TAKE_PROFIT_PCT))
-        sl_price_str = exchange.price_to_precision(SYMBOL, order_price * (1 - STOP_LOSS_PCT))
-        
-        # SINTASSI CCXT UNIFICATA PER TP/SL: Pienamente compatibile e sicura
-        params = {
-            'takeProfit': {
-                'type': 'market',
-                'triggerPrice': tp_price_str,
-            },
-            'stopLoss': {
-                'type': 'market',
-                'triggerPrice': sl_price_str,
-            }
+        body = {
+            "symbol": SYMBOL,
+            "productType": PRODUCT_TYPE,
+            "marginMode": "crossed", 
+            "marginCoin": "USDT",
+            "size": sol_size,
+            "price": price_str,
+            "side": "buy",
+            "tradeSide": "open",
+            "orderType": "limit",
+            "force": "gtc",
+            "presetTakeProfitPrice": tp_str,
+            "presetStopLossPrice": sl_str,
+            "clientOid": f"FC_{int(time.time()*1000)}_{i}"
         }
         
-        try:
-            # Passiamo le STRINGHE direttamente a CCXT per evitare errori di floating point
-            exchange.create_order(
-                symbol=SYMBOL,
-                type='limit',
-                side='buy',
-                amount=sol_amount_str,
-                price=price_str,
-                params=params
-            )
-            print(f"{C_CYAN}[+] Ordine {i+1} Piazzato:{C_RESET} {sol_amount_str} SOL a {price_str}$ | TP: {tp_price_str}$ | SL: {sl_price_str}$")
-            time.sleep(0.3) 
-        except Exception as e:
-            print(f"{C_RED}[-] Errore invio ordine {i+1}: {e}{C_RESET}")
+        res = bitget_request('POST', '/api/v2/mix/order/place-order', body=body)
+        if res and res.get('code') == '00000':
+            print(f"{C_CYAN}[+] Ordine {i+1} Piazzato:{C_RESET} {sol_size} SOL a {price_str}$ | TP: {tp_str}$ | SL: {sl_str}$")
+        time.sleep(0.2) 
 
 # ==========================================
-# 6. DASHBOARD E LOGGING
+# 6. GESTIONE DASHBOARD ULTRA-DETTAGLIATA
 # ==========================================
-def update_dashboard():
+def update_dashboard(current_price, recent_high, current_drop_pct):
     global in_position, has_entered, INITIAL_BALANCE
     
     try:
-        balance = exchange.fetch_balance()
-        usdt_balance = float(balance['total'].get('USDT', 0.0))
-        if INITIAL_BALANCE == 0.0:
+        # 1. Recupero Saldo (Estremamente blindato contro i crash)
+        acc_res = bitget_request('GET', '/api/v2/mix/account/accounts', params={'marginCoin': 'USDT', 'productType': PRODUCT_TYPE})
+        usdt_balance = 0.0
+        
+        if acc_res and acc_res.get('code') == '00000':
+            data_list = acc_res.get('data', [])
+            if isinstance(data_list, list):
+                for coin in data_list:
+                    if coin.get('marginCoin') == 'USDT':
+                        usdt_balance = float(coin.get('equity', 0))
+                        break
+                    
+        if INITIAL_BALANCE == 0.0 and usdt_balance > 0:
             INITIAL_BALANCE = usdt_balance
         session_profit = usdt_balance - INITIAL_BALANCE
         
-        positions = exchange.fetch_positions([SYMBOL])
-        open_orders = exchange.fetch_open_orders(SYMBOL)
-        
+        # 2. Recupero Posizioni
+        pos_res = bitget_request('GET', '/api/v2/mix/position/single-position', 
+                                 params={'marginCoin': 'USDT', 'productType': PRODUCT_TYPE, 'symbol': SYMBOL})
         pos_size = 0.0
         unrealized_pnl = 0.0
         entry_price = 0.0
         
-        if positions and len(positions) > 0:
-            pos = positions[0]
-            pos_size = float(pos.get('contracts', 0.0))
-            if pos_size > 0:
-                unrealized_pnl = float(pos.get('unrealizedPnl', 0.0))
-                entry_price = float(pos.get('entryPrice', 0.0))
+        if pos_res and pos_res.get('code') == '00000':
+            data_list = pos_res.get('data', [])
+            if isinstance(data_list, list):
+                for p in data_list:
+                    size = float(p.get('total', 0))
+                    if size > 0:
+                        pos_size = size
+                        unrealized_pnl = float(p.get('unrealizedPL', 0))
+                        entry_price = float(p.get('averageOpenPrice', 0))
+                        break 
         
-        # Logica Anti-Phantom Orders
+        # 3. Recupero Ordini Aperti
+        ord_res = bitget_request('GET', '/api/v2/mix/order/orders-pending', params={'productType': PRODUCT_TYPE, 'symbol': SYMBOL})
+        open_orders_count = 0
+        
+        if ord_res and ord_res.get('code') == '00000':
+            data_dict = ord_res.get('data', {})
+            if isinstance(data_dict, dict):
+                entrusted = data_dict.get('entrustedList', [])
+                if isinstance(entrusted, list):
+                    open_orders_count = len(entrusted)
+        
+        # 4. Logica Anti-Phantom Orders
         if in_position:
             if pos_size > 0:
                 has_entered = True 
                 
             if has_entered and pos_size == 0:
-                print(f"\n{C_GREEN}[$] TAKE PROFIT O STOP LOSS COLPITO! Chiudo l'operazione.[$]{C_RESET}")
-                exchange.cancel_all_orders(SYMBOL)
-                print(f"{C_CYAN}[+] Ordini fantasma cancellati. Resetto il bot.{C_RESET}")
+                print(f"\n{C_GREEN}[$$$] TAKE PROFIT O STOP LOSS COLPITO! Chiudo l'operazione. [$$$]{C_RESET}")
+                
+                bitget_request('POST', '/api/v2/mix/order/cancel-all-orders', 
+                               body={'symbol': SYMBOL, 'productType': PRODUCT_TYPE, 'marginCoin': 'USDT'})
+                
+                print(f"{C_CYAN}[+] Ordini in eccesso cancellati. Resetto il bot in attesa.{C_RESET}")
                 in_position = False
                 has_entered = False
                 return 
         
-        print(f"\n{C_YELLOW}--- BITGET UTA BOT | {datetime.now().strftime('%H:%M:%S')} ---{C_RESET}")
-        print(f"💰 Saldo: {usdt_balance:.2f} USDT (PnL Sessione: {C_GREEN if session_profit >= 0 else C_RED}{session_profit:+.2f}${C_RESET})")
+        # 5. STAMPA DEL TERMINALE GRAFICO
+        os.system('cls' if os.name == 'nt' else 'clear') # Pulisce lo schermo per fare l'effetto "Dashboard live"
+        
+        print(f"{C_CYAN}=============================================================={C_RESET}")
+        print(f"🤖 {C_YELLOW}BITGET FLASH-CRASH BOT{C_RESET} | ⏱️ Orario Server: {datetime.now().strftime('%H:%M:%S')}")
+        print(f"{C_CYAN}=============================================================={C_RESET}")
+        print(f"💰 {C_GREEN}IL TUO CONTO{C_RESET}")
+        print(f"   Saldo Attuale : {usdt_balance:.2f} USDT")
+        pnl_session_color = C_GREEN if session_profit >= 0 else C_RED
+        print(f"   PnL Sessione  : {pnl_session_color}{session_profit:+.2f} USDT{C_RESET}")
+        print(f"{C_CYAN}--------------------------------------------------------------{C_RESET}")
+        print(f"📊 {C_GREEN}ANALISI MERCATO [{SYMBOL}]{C_RESET}")
+        print(f"   Prezzo Attuale: {current_price:.4f}$")
+        print(f"   Max Recente   : {recent_high:.4f}$ (Ultime candele)")
+        
+        drop_color = C_RED if current_drop_pct < -1.5 else C_YELLOW
+        print(f"   Drop Valutato : {drop_color}{current_drop_pct:.2f}%{C_RESET} (Innesco al -{CRASH_DROP_PCT*100:.1f}%)")
+        print(f"{C_CYAN}--------------------------------------------------------------{C_RESET}")
         
         if in_position:
-            print(f"⏳ Stato: {C_CYAN}IN TRADE{C_RESET} (Candela {candles_waited}/{MAX_HOLD_CANDLES}) | 📋 Ordini attivi: {len(open_orders)}")
+            print(f"⏳ {C_CYAN}STATO: IN TRADE{C_RESET} (Minuti Trascorsi: {candles_waited*5}/{MAX_HOLD_CANDLES*5})")
+            print(f"   Ordini Limite Attivi nel Book: {open_orders_count}")
             if pos_size > 0:
                 pnl_c = C_GREEN if unrealized_pnl >= 0 else C_RED
-                print(f"🔥 Size: {pos_size} SOL @ {entry_price:.3f}$ | PnL: {pnl_c}{unrealized_pnl:+.3f}${C_RESET}")
+                print(f"🔥 Size Aperta  : {pos_size} SOL a {entry_price:.4f}$")
+                print(f"💵 Profitto Live: {pnl_c}{unrealized_pnl:+.3f} USDT{C_RESET}")
             else:
-                print("🕸️ Griglia piazzata. Nessun ordine colpito finora.")
+                print("🕸️ Rete di ordini piazzata. In attesa che il mercato ci colpisca...")
         else:
-            print(f"🎯 Stato: {C_GREEN}IN AGGUATO{C_RESET} | Nessuna operazione in corso.")
-            
-        print("-" * 35)
+            print(f"🎯 {C_GREEN}STATO: IN AGGUATO{C_RESET} (Cerco candela di crollo...)")
+        print(f"{C_CYAN}=============================================================={C_RESET}\n")
         
     except Exception as e:
-        print(f"{C_RED}[!] Errore lettura dati account: {e}{C_RESET}")
+        print(f"{C_RED}[!] Errore critico nella Dashboard. Il bot continua a funzionare. Dettagli: {e}{C_RESET}")
 
 # ==========================================
 # 7. CICLO PRINCIPALE
@@ -194,9 +292,8 @@ def update_dashboard():
 def run_bot():
     global in_position, has_entered, candles_waited, last_closed_candle_time
     
-    print(f"\n{C_CYAN}[*] Inizializzazione Bot su Bitget UTA...{C_RESET}")
-    exchange.load_markets()
-    update_dashboard() 
+    print(f"\n{C_CYAN}[*] Inizializzazione Motore Quantitativo Bitget...{C_RESET}")
+    time.sleep(2)
     
     while True:
         try:
@@ -205,11 +302,18 @@ def run_bot():
                 time.sleep(5)
                 continue
             
+            # Calcoli live per la Dashboard
+            current_price = df['close'].iloc[-1]
+            recent_high = df['high'].iloc[-4:-1].max() 
+            current_drop_pct = ((current_price - recent_high) / recent_high) * 100
+            
+            # Aggiornamento Dashboard grafica
+            update_dashboard(current_price, recent_high, current_drop_pct)
+            
             current_closed_time = df.iloc[-2]['timestamp']
             
-            if last_closed_candle_time != current_closed_time:
+            if last_closed_candle_time is None or last_closed_candle_time != current_closed_time:
                 last_closed_candle_time = current_closed_time
-                current_price = df['close'].iloc[-1]
                 
                 if not in_position:
                     if check_flash_crash_signal(df):
@@ -222,74 +326,46 @@ def run_bot():
                     candles_waited += 1
                     
                     if candles_waited >= MAX_HOLD_CANDLES:
-                        print(f"\n{C_YELLOW}[!] Tempo scaduto ({MAX_HOLD_CANDLES * 5} min). Chiusura forzata.{C_RESET}")
-                        exchange.cancel_all_orders(SYMBOL)
+                        print(f"\n{C_YELLOW}[!] Tempo scaduto ({MAX_HOLD_CANDLES * 5} min). Forzo la chiusura.{C_RESET}")
                         
-                        positions = exchange.fetch_positions([SYMBOL])
-                        if positions and len(positions) > 0:
-                            size_to_close = float(positions[0].get('contracts', 0.0))
-                            if size_to_close > 0:
-                                # Approccio ultra-sicuro per Bitget (supporta Hedge e One-Way)
-                                pos_side = positions[0].get('side', 'long')
-                                side_to_close = 'sell' if pos_side == 'long' else 'buy'
-                                
-                                exchange.create_order(
-                                    symbol=SYMBOL, 
-                                    type='market', 
-                                    side=side_to_close, 
-                                    amount=size_to_close,
-                                    params={'reduceOnly': True}
-                                )
-                                print(f"{C_CYAN}[+] Posizione chiusa a mercato (Size: {size_to_close}).{C_RESET}")
+                        bitget_request('POST', '/api/v2/mix/order/cancel-all-orders', 
+                                       body={'symbol': SYMBOL, 'productType': PRODUCT_TYPE, 'marginCoin': 'USDT'})
+                        
+                        pos_res = bitget_request('GET', '/api/v2/mix/position/single-position', 
+                                                 params={'marginCoin': 'USDT', 'productType': PRODUCT_TYPE, 'symbol': SYMBOL})
+                        
+                        if pos_res and pos_res.get('code') == '00000' and pos_res.get('data'):
+                            for p in pos_res['data']:
+                                size_to_close = float(p.get('total', 0))
+                                if size_to_close > 0:
+                                    hold_side = p.get('holdSide', 'long')
+                                    close_side = 'sell' if hold_side == 'long' else 'buy'
+                                    
+                                    close_body = {
+                                        "symbol": SYMBOL,
+                                        "productType": PRODUCT_TYPE,
+                                        "marginMode": "crossed",
+                                        "marginCoin": "USDT",
+                                        "size": round_step(size_to_close, SIZE_DECIMALS),
+                                        "side": close_side,
+                                        "tradeSide": "close",
+                                        "orderType": "market"
+                                    }
+                                    res_close = bitget_request('POST', '/api/v2/mix/order/place-order', body=close_body)
+                                    if res_close and res_close.get('code') == '00000':
+                                        print(f"{C_CYAN}[+] Posizione salvata a mercato (Size: {size_to_close}).{C_RESET}")
+                                        time.sleep(2)
                         
                         in_position = False
                         has_entered = False
                         candles_waited = 0
             
-            update_dashboard()
+            # Attende 15 secondi prima del prossimo refresh
             time.sleep(15)
             
         except Exception as e:
-            print(f"{C_RED}[!] Errore critico nel Loop: {e}{C_RESET}")
+            print(f"{C_RED}[!] Errore nel Loop (Ritento tra 10s): {e}{C_RESET}")
             time.sleep(10)
-
-            # ==========================================
-# FUNZIONE DI TEST IMMEDIATO (RICHIESTA)
-# ==========================================
-def test_api_connection():
-    print(f"\n{C_YELLOW}[!] AVVIO TEST DI CONNESSIONE E ORDINE IMMEDIATO...{C_RESET}")
-    try:
-        test_size = 0.1 
-        print(f"[*] Apertura ordine di test: {test_size} SOL a mercato...")
-        
-        # Apertura Long a Mercato
-        order = exchange.create_order(
-            symbol=SYMBOL,
-            type='market',
-            side='buy',
-            amount=test_size
-        )
-        print(f"{C_GREEN}[+] Ordine aperto con successo! ID: {order['id']}{C_RESET}")
-        
-        print(f"[*] Attesa di 60 secondi prima della chiusura...")
-        time.sleep(60)
-        
-        # Chiusura a Mercato
-        print(f"[*] Chiusura ordine di test...")
-        exchange.create_order(
-            symbol=SYMBOL,
-            type='market',
-            side='sell',
-            amount=test_size,
-            params={'reduceOnly': True}
-        )
-        print(f"{C_GREEN}[+] Test completato. Ordine chiuso correttamente.{C_RESET}")
-        print(f"{C_CYAN}[*] Il bot entrerà ora in modalità 'Cacciatore'.{C_RESET}\n")
-        
-    except Exception as e:
-        print(f"{C_RED}[!] ERRORE DURANTE IL TEST API: {e}{C_RESET}")
-        print(f"{C_RED}[!] Verifica permessi API (Futures/UTA) e Saldo USDT.{C_RESET}")
-        exit() # Ferma il bot se il test fallisce
 
 if __name__ == "__main__":
     run_bot()
