@@ -1,1 +1,87 @@
-📋 Documentazione Strategia: "SOL Flash-Crash Grid Absorber"1. Obiettivo della StrategiaSfruttare le inefficienze di liquidità durante i crolli repentini (Flash Crash) di Solana. Invece di inseguire il prezzo, il bot agisce come un fornitore di liquidità, acquistando su livelli di prezzo predefiniti durante la "coda" del crollo per beneficiare del rimbalzo tecnico (V-shape recovery).2. Configurazione TecnicaAsset: SOL/USDT (Futures Perpetui).Timeframe di scansione: 5 Minuti.Strumento di esecuzione: Ordini Limite (per eliminare lo slippage e ridurre le commissioni).3. Trigger Operativo (Fase di Innesco)Il bot monitora la chiusura di ogni candela a 5 minuti. Il segnale viene generato solo se le seguenti tre condizioni si verificano contemporaneamente:Il Crollo (Price Drop): Il prezzo minimo della candela attuale deve essere inferiore di almeno il 3% rispetto al massimo registrato nelle due candele precedenti (finestra di 15 minuti).Il Volume (Panic Confirmation): Il volume della candela deve essere superiore di almeno il 50% rispetto alla media mobile semplice (SMA) degli ultimi 50 periodi.La Rejection (Segnale di Vita): La candela deve chiudere Verde (Prezzo di chiusura > Prezzo di apertura). Questo indica che la pressione di vendita è stata assorbita.4. Architettura di Ingresso (DCA Grid)Alla chiusura della candela "Trigger", il bot non acquista a mercato, ma piazza immediatamente 3 Ordini Limite per coprire l'ulteriore escursione negativa (MAE):Livello 1: Prezzo di chiusura -0.5% | Alloca il 30% del capitale destinato al trade.Livello 2: Prezzo di chiusura -1.5% | Alloca il 30% del capitale destinato al trade.Livello 3: Prezzo di chiusura -2.5% | Alloca il 40% del capitale destinato al trade.Vantaggio: Se il prezzo continua a scendere dopo l'ingresso, il prezzo medio di carico (Average Entry Price) si abbassa costantemente.5. Gestione dell'Uscita (Exit Strategy)Il bot gestisce l'uscita in modo meccanico per minimizzare l'esposizione al rischio:Take Profit (TP): Posizionato a +2.5% dal prezzo medio di carico. Viene eseguito automaticamente via API.Stop Loss (SL): Posizionato a -5.0% dal prezzo medio di carico. È uno stop loss "hard" di emergenza.Time Exit (Chiusura Temporale): Se dopo 60 minuti (12 candele) il trade non ha colpito né il TP né lo SL, il bot cancella tutti gli ordini limite pendenti e chiude la posizione residua a mercato.📈 Analisi delle Performance (Backtest 12 Mesi)Il passaggio dalla semplice strategia "Buy Market" alla strategia "Grid DCA" ha prodotto i seguenti miglioramenti:MetricaStrategia Standard (Market)Strategia Grid DCA (Ottimizzata)Win Rate58.62%69.57%Profit Factor2.151.54 (più stabile)Max Drawdown-11.78% (con SL 2%)-7.44%SlippageElevato (Negativo)Zero (Ordini Limite)Perché il Profit Factor è sceso leggermente?Perché la versione DCA è più conservativa: non sempre tutti e tre gli ordini vengono eseguiti (utilizzo medio del capitale: 58%). Tuttavia, questa prudenza è ciò che mantiene il Max Drawdown sotto il 7.5%, rendendo la strategia scalabile con capitali più importanti.🛠 Note per l'Implementazione (Bot Python)Libreria: Si raccomanda l'uso di ccxt per la compatibilità con Bitget/Binance.Esecuzione: Il bot deve girare su un server (VPS) per garantire zero latenza nel piazzamento della griglia dopo il trigger.Sincronizzazione: Il bot deve richiamare i dati API ogni 300 secondi (5 minuti), esattamente 2 secondi dopo la chiusura della candela per assicurarsi che i dati di volume siano consolidati dall'exchange.
+# 🤖 Bitget Quant Bot: Strategia "3 Corvi Rossi"
+
+Questo è un bot di trading quantitativo automatizzato sviluppato in Python per l'exchange **Bitget** (Mercato USDT-FUTURES). Il bot scansiona costantemente il mercato alla ricerca di specifici pattern di panico ribassista per piazzare una rete di acquisto DCA (Dollar Cost Averaging) e catturare il rimbalzo fisiologico.
+
+---
+
+## 📊 La Strategia
+La logica del bot si basa su parametri rigidamente testati statisticamente su un backtest di 2 anni:
+
+1. **Identificazione del Panico:** Il bot analizza le ultime 3 candele chiuse (Timeframe: 15 minuti). Se sono **tutte e tre rosse consecutive** e il prezzo è sceso di almeno l'**1.5%** rispetto al picco massimo (High-Water Mark) toccato in quell'arco di tempo, il segnale si attiva.
+2. **Ingresso a Rete (DCA):** Il bot piazza istantaneamente una rete di 3 ordini Limite (Batch Orders) sotto al prezzo di innesco:
+   * 30% del capitale a -0.5%
+   * 30% del capitale a -1.5%
+   * 40% del capitale a -2.5%
+3. **Uscita Rapida:** Ogni ordine ha un Take Profit preimpostato all'**1.2%** e uno Stop Loss protettivo al **6.0%**.
+4. **Timeout di Sicurezza:** Se la posizione non colpisce né TP né SL entro **4 ore** (16 candele), il bot chiude forzatamente a mercato per evitare di rimanere bloccato in un trend avverso.
+
+---
+
+## 🛠️ Requisiti di Sistema e Installazione
+Il bot è progettato per essere estremamente leggero, ideale per VPS Linux (es. AWS EC2 Nano) con risorse limitate (<500MB RAM).
+
+**1. Installa le dipendenze Python necessarie:**
+```bash
+pip install pandas requests python-dotenv
+```
+2. Crea il file delle variabili d'ambiente (.env):
+3. Crea un file chiamato .env nella stessa cartella di bot.py e inserisci le tue credenziali API di Bitget:
+Snippet di codice
+```
+API_KEY=inserisci_qui_la_tua_api_key
+SECRET_KEY=inserisci_qui_il_tuo_secret_key
+PASSPHRASE=inserisci_qui_la_tua_passphrase
+```
+## ⚙️ Configurazione Parametri (`bot.py`)
+
+All'interno del file principale, puoi modificare le costanti operative in cima allo script:
+
+| Variabile | Valore Default | Descrizione |
+| :--- | :--- | :--- |
+| `SYMBOL` | `SOLUSDT` | La coppia di trading su cui operare. |
+| `TIMEFRAME` | `15m` | Risoluzione delle candele. |
+| `CAPITAL_TO_USE` | `100.0` | Capitale totale (in USDT) da dividere per la rete DCA. |
+| `CRASH_DROP_PCT` | `0.015` | Drop cumulativo minimo (1.5%) per attivare il setup. |
+| `TAKE_PROFIT_PCT` | `0.012` | Target di profitto (1.2%). |
+| `STOP_LOSS_PCT` | `0.060` | Stop loss massimo di emergenza (6.0%). |
+| `MAX_HOLD_CANDLES` | `16` | Candele massime di attesa prima della chiusura forzata. |
+
+---
+
+## 🏗️ Architettura del Codice (Clean Architecture)
+
+Il codice è suddiviso in moduli funzionali per facilitare la lettura e la manutenzione:
+
+* **Moduli API:** Gestiscono la firma HMAC-SHA256 e le chiamate di rete.
+* **Moduli Dati:** Scaricano lo storico (`get_market_data`) e verificano la strategia (`check_flash_crash_signal`).
+* **Modulo Ordini:** Invia le operazioni a mercato in formato Batch.
+* **Modulo Dashboard:** Estrae i dati del conto (`get_account_balance`, `get_position_info`) e li renderizza a schermo separatamente dalla logica operativa.
+
+---
+
+## 🚀 Come Eseguire il Bot in Produzione
+
+Per avviare il bot su un server senza che si spenga quando chiudi la finestra del terminale, usa `screen`:
+
+1.  **Avvia una sessione in background:**
+    ```bash
+    screen -S quantbot
+    ```
+2.  **Lancia lo script** (usa `-u` per forzare l'output live sul terminale):
+    ```bash
+    python3 -u bot.py
+    ```
+3.  **Sganciati dalla sessione (Detach):**
+    Premi `CTRL + A` seguito dal tasto `D`. Ora puoi chiudere il terminale in sicurezza.
+4.  **Per riaprire la dashboard:**
+    ```bash
+    screen -r quantbot
+    ```
+
+---
+
+## ⚠️ Sicurezza e Avvertenze
+
+* **Permessi API:** Assicurati che l'API Key generata su Bitget abbia permessi **esclusivi** per il trading "USDT-M Futures". **NON abilitare mai i permessi di prelievo (Withdrawal)**.
+* **Anti-Disconnessione:** Il bot possiede una variabile di sicurezza (`pos_api_success`) che gli impedisce di resettare la strategia se le API di Bitget non rispondono correttamente, prevenendo chiusure di posizione fantasma.
+* **Disclaimer:** Il trading algoritmico comporta rischi di mercato. Non far girare il bot con fondi superiori a quelli impostati nel parametro `CAPITAL_TO_USE` senza aver compreso pienamente il meccanismo della griglia.
